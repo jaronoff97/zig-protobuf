@@ -148,6 +148,46 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         }),
+        b.addTest(.{
+            .name = "editions",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tests_editions.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        }),
+        b.addTest(.{
+            .name = "extensions",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tests_extensions.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        }),
+        b.addTest(.{
+            .name = "options",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tests_options.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        }),
+        b.addTest(.{
+            .name = "upstream_options",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tests_upstream_options.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        }),
+        b.addTest(.{
+            .name = "stream",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/stream.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        }),
     };
 
     const convertStep = RunProtocStep.createWithGenerator(b, exe, .{
@@ -160,13 +200,31 @@ pub fn build(b: *std.Build) !void {
         .destination_directory = b.path("tests/generated"),
         .source_files = &.{
             b.path("tests/protos_for_test/all.proto"),
-            b.path("tests/protos_for_test/whitespace-in-name.proto"),
             b.path("tests/protos_for_test/complex_type.proto"),
+            b.path("tests/protos_for_test/editions.proto"),
+            b.path("tests/protos_for_test/editions2026.proto"),
+            b.path("tests/protos_for_test/extensions.proto"),
+            b.path("tests/protos_for_test/extensions_editions.proto"),
+            b.path("tests/protos_for_test/options.proto"),
             b.path("tests/protos_for_test/test_service.proto"),
+            b.path("tests/protos_for_test/whitespace-in-name.proto"),
         },
         .include_directories = &.{b.path("tests/protos_for_test")},
     });
 
+    // Upstream protobuf test protos for options, see tests/protos_for_test/upstream.
+    const convertUpstream = RunProtocStep.createWithGenerator(b, exe, .{
+        .destination_directory = b.path("tests/generated/upstream"),
+        .source_files = &.{
+            b.path("tests/protos_for_test/upstream/google/protobuf/unittest_custom_options.proto"),
+            b.path("tests/protos_for_test/upstream/google/protobuf/unittest_custom_options_unlinked.proto"),
+            b.path("tests/protos_for_test/upstream/google/protobuf/unittest_import_option.proto"),
+            b.path("tests/protos_for_test/upstream/google/protobuf/unittest_retention.proto"),
+            b.path("tests/protos_for_test/upstream/ported/custom_options_import.proto"),
+            b.path("tests/protos_for_test/upstream/ported/custom_options_option_import.proto"),
+        },
+        .include_directories = &.{b.path("tests/protos_for_test/upstream")},
+    });
     for (tests) |test_item| {
         if (!std.mem.eql(u8, "protobuf", test_item.name)) {
             test_item.root_module.addImport("protobuf", module);
@@ -178,8 +236,9 @@ pub fn build(b: *std.Build) !void {
         // This will evaluate the `test` step rather than the default, which is "install".
         const run_main_tests = b.addRunArtifact(test_item);
 
-        test_item.step.dependOn(&convertStep.step);
-        test_item.step.dependOn(&convertStep2.step);
+        test_item.step.dependOn(convertStep.step);
+        test_item.step.dependOn(convertStep2.step);
+        test_item.step.dependOn(convertUpstream.step);
 
         test_step.dependOn(&run_main_tests.step);
     }
@@ -194,8 +253,8 @@ pub fn build(b: *std.Build) !void {
             include.path(b, "google/protobuf/compiler/plugin.proto"),
             include.path(b, "google/protobuf/descriptor.proto"),
         },
-        .include_directories = &.{},
+        .include_directories = &.{include},
     });
 
-    bootstrap.dependOn(&bootstrapConversion.step);
+    bootstrap.dependOn(bootstrapConversion.step);
 }

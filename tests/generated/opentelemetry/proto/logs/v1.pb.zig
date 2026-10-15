@@ -4,6 +4,7 @@ const std = @import("std");
 
 const protobuf = @import("protobuf");
 const fd = protobuf.fd;
+const fdf = protobuf.fdf;
 /// import package opentelemetry.proto.common.v1
 const opentelemetry_proto_common_v1 = @import("../common/v1.pb.zig");
 /// import package opentelemetry.proto.resource.v1
@@ -88,6 +89,10 @@ pub const LogsData = struct {
         return protobuf.decode(@This(), reader, allocator);
     }
 
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         return protobuf.deinit(allocator, self);
@@ -148,7 +153,7 @@ pub const ResourceLogs = struct {
     pub const _desc_table = .{
         .resource = fd(1, .submessage),
         .scope_logs = fd(2, .{ .repeated = .submessage }),
-        .schema_url = fd(3, .{ .scalar = .string }),
+        .schema_url = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
     };
 
     /// Encodes the message to the writer
@@ -169,6 +174,10 @@ pub const ResourceLogs = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -230,7 +239,7 @@ pub const ScopeLogs = struct {
     pub const _desc_table = .{
         .scope = fd(1, .submessage),
         .log_records = fd(2, .{ .repeated = .submessage }),
-        .schema_url = fd(3, .{ .scalar = .string }),
+        .schema_url = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
     };
 
     /// Encodes the message to the writer
@@ -251,6 +260,10 @@ pub const ScopeLogs = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -308,7 +321,7 @@ pub const ScopeLogs = struct {
 pub const LogRecord = struct {
     time_unix_nano: u64 = 0,
     observed_time_unix_nano: u64 = 0,
-    severity_number: SeverityNumber = @enumFromInt(0),
+    severity_number: SeverityNumber = @fromBackingInt(0),
     severity_text: []const u8 = &.{},
     body: ?opentelemetry_proto_common_v1.AnyValue = null,
     attributes: std.ArrayList(opentelemetry_proto_common_v1.KeyValue) = .empty,
@@ -321,7 +334,7 @@ pub const LogRecord = struct {
         .time_unix_nano = fd(1, .{ .scalar = .fixed64 }),
         .observed_time_unix_nano = fd(11, .{ .scalar = .fixed64 }),
         .severity_number = fd(2, .@"enum"),
-        .severity_text = fd(3, .{ .scalar = .string }),
+        .severity_text = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
         .body = fd(5, .submessage),
         .attributes = fd(6, .{ .repeated = .submessage }),
         .dropped_attributes_count = fd(7, .{ .scalar = .uint32 }),
@@ -348,6 +361,10 @@ pub const LogRecord = struct {
     ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
         return protobuf.decode(@This(), reader, allocator);
     }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
 
     /// Deinitializes and frees the memory associated with the message.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {

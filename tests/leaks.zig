@@ -93,3 +93,22 @@ test "dupe does not leak on mid-duplication allocation failure" {
         .{},
     );
 }
+
+test "dupe: oneof submessage with repeated string" {
+    // The active oneof variant is a submessage whose repeated string list must
+    // be freed (items and buffer) by deinit after a dupe round trip.
+    var inner: unittest.TestAllTypes = .{};
+    try inner.repeated_string.append(testing.allocator, try testing.allocator.dupe(u8, "hello"));
+    try inner.repeated_string.append(testing.allocator, try testing.allocator.dupe(u8, "world"));
+
+    var msg: unittest.TestOneof = .{ .foo = .{ .foo_message = inner } };
+    defer msg.deinit(testing.allocator);
+
+    var copy = try msg.dupe(testing.allocator);
+    defer copy.deinit(testing.allocator);
+
+    const copied = copy.foo.?.foo_message.repeated_string.items;
+    try testing.expectEqual(2, copied.len);
+    try testing.expectEqualSlices(u8, "hello", copied[0]);
+    try testing.expectEqualSlices(u8, "world", copied[1]);
+}

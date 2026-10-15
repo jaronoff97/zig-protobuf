@@ -2,6 +2,8 @@
 const std = @import("std");
 
 const protobuf = @import("protobuf.zig");
+const extension = @import("extension.zig");
+const ExtensionRegistry = extension.ExtensionRegistry;
 const builtin = @import("builtin");
 const log = if (builtin.os.tag != .freestanding) std.log.scoped(.zig_protobuf) else struct {
     // no-op log implementation for freestanding targets
@@ -86,8 +88,18 @@ pub const Tag = packed struct(u32) {
         /// Number of bytes consumed from reader.
         usize,
     } {
-        const raw_result: u32, const consumed: usize =
-            try decodeScalar(.uint32, reader);
+        // Unlike uint32 values, tags may not be truncated: a tag is at most 5
+        // bytes long and its value must fit in 32 bits.
+        var raw_result: u32 = 0;
+        const consumed: usize = for (0..5) |i| {
+            const b = try reader.takeByte();
+            if (i == 4 and b > 0x0F) {
+                @branchHint(.cold);
+                return error.InvalidInput;
+            }
+            raw_result |= @as(u32, b & 0x7F) << @intCast(7 * i);
+            if (b & 0x80 == 0) break i + 1;
+        } else unreachable; // the 5th byte never has its continuation bit set
 
         const invalid_wire_type = (raw_result & 0x7) > 5;
         if (invalid_wire_type) {
@@ -112,6 +124,17 @@ pub const Tag = packed struct(u32) {
         try std.testing.expectEqual(5, consumed);
         try std.testing.expectEqual(.fixed32, tag.wire_type);
         try std.testing.expectEqual(0x1FFFFFFF, tag.field);
+
+        // Values above UINT32_MAX and tags longer than 5 bytes are invalid.
+        const invalid: []const []const u8 = &.{
+            &.{ 0x80, 0x80, 0x80, 0x80, 0x40 },
+            &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x0F },
+            &.{ 0x88, 0x80, 0x80, 0x80, 0x80, 0x00 },
+        };
+        for (invalid) |input| {
+            var r: std.Io.Reader = .fixed(input);
+            try std.testing.expectError(error.InvalidInput, decode(&r));
+        }
     }
 };
 
@@ -199,8 +222,8 @@ pub const ZigZag = struct {
 /// with `_`), any integer value is valid. For exhaustive enums, only declared values
 /// are accepted.
 inline fn enumFromRaw(comptime E: type, raw: i32) ?E {
-    if (comptime !@typeInfo(E).@"enum".is_exhaustive) {
-        return @enumFromInt(raw);
+    if (comptime @typeInfo(E).@"enum".mode == .nonexhaustive) {
+        return @fromBackingInt(@intCast(raw));
     }
     return std.enums.fromInt(E, raw);
 }
@@ -386,6 +409,18 @@ pub fn decodeRepeated(
         /// Number of bytes to parse. Provided for length-delimited records
         /// or packed repeated fields.
         bytes: ?usize = null,
+        /// Field number of a delimited (group-encoded) submessage element,
+        /// whose end is marked by the matching EGROUP tag.
+        group: ?u32 = null,
+        /// Reject strings that are not valid UTF-8.
+        verify_utf8: bool = false,
+        /// Where closed-enum values that do not match any enumerator are
+        /// stored, as unknown varint fields numbered `field_number`. They are
+        /// dropped when null.
+        unknown_fields: ?*std.ArrayList(u8) = null,
+        field_number: u29 = 0,
+        /// Known extensions, validated in decoded submessages.
+        extensions: ?*const ExtensionRegistry = null,
     },
 ) (std.Io.Reader.Error || std.mem.Allocator.Error || protobuf.DecodingError)!usize {
     comptime std.debug.assert(@typeInfo(@TypeOf(result)) == .pointer);
@@ -406,6 +441,10 @@ pub fn decodeRepeated(
 
                 const bytes = try reader.readAlloc(allocator, options.bytes.?);
                 errdefer allocator.free(bytes);
+                if (options.verify_utf8 and !std.unicode.utf8ValidateSlice(bytes)) {
+                    @branchHint(.cold);
+                    return error.InvalidInput;
+                }
 
                 try result.append(allocator, bytes);
                 return bytes.len;
@@ -459,12 +498,12 @@ pub fn decodeRepeated(
                 var consumed: usize = 0;
                 while (consumed < bytes) {
                     const raw, const c = try decodeScalar(.int32, reader);
-                    const decoded = enumFromRaw(Result, raw) orelse {
-                        @branchHint(.cold);
-                        return error.InvalidInput;
-                    };
-                    result.appendAssumeCapacity(decoded);
                     consumed += c;
+                    if (enumFromRaw(Result, raw)) |decoded| {
+                        result.appendAssumeCapacity(decoded);
+                    } else if (options.unknown_fields) |unknown| {
+                        try appendUnknownVarint(allocator, unknown, options.field_number, raw);
+                    }
                 }
                 if (consumed > bytes) {
                     @branchHint(.cold);
@@ -475,17 +514,17 @@ pub fn decodeRepeated(
             // Unpacked repeated enum.
             else {
                 const raw, const consumed = try decodeScalar(.int32, reader);
-                const decoded = enumFromRaw(Result, raw) orelse {
-                    @branchHint(.cold);
-                    return error.InvalidInput;
-                };
-                try result.append(allocator, decoded);
+                if (enumFromRaw(Result, raw)) |decoded| {
+                    try result.append(allocator, decoded);
+                } else if (options.unknown_fields) |unknown| {
+                    try appendUnknownVarint(allocator, unknown, options.field_number, raw);
+                }
                 return consumed;
             }
         },
         .submessage => {
-            // Submessages are length-delimited, and cannot be packed.
-            std.debug.assert(options.bytes != null);
+            // Submessages are length-prefixed or delimited, and cannot be packed.
+            std.debug.assert(options.bytes != null or options.group != null);
 
             // Ensure capacity before append to reduce reallocations. When at
             // capacity, grow by at least 8 (or double) to amortize allocation
@@ -502,12 +541,12 @@ pub fn decodeRepeated(
                 msg,
                 allocator,
                 reader,
-                .{ .bytes = options.bytes },
+                .{ .bytes = options.bytes, .group = options.group, .extensions = options.extensions },
             );
-            if (consumed > options.bytes.?) {
+            if (options.bytes) |bytes| if (consumed > bytes) {
                 @branchHint(.cold);
                 return error.InvalidInput;
-            }
+            };
             return consumed;
         },
     }
@@ -630,7 +669,8 @@ test "captureField rejects over-long length varint" {
 
     // 11 bytes all with the high (continuation) bit set: never terminates
     // within the 10-byte varint limit.
-    const input: []const u8 = &(.{0x80} ** 11);
+    const input_bytes: [11]u8 = @splat(0x80);
+    const input: []const u8 = &input_bytes;
     var reader: std.Io.Reader = .fixed(input);
 
     const tag: Tag = .{ .wire_type = .len, .field = 1 };
@@ -647,7 +687,7 @@ test "captureField accepts a maximal 10-byte length varint shape" {
     defer buf.deinit(std.testing.allocator);
 
     // 10-byte length varint encoding 0, then no payload (length 0).
-    const len_varint: []const u8 = &(.{0x80} ** 9 ++ .{0x00});
+    const len_varint: []const u8 = &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 };
     var reader: std.Io.Reader = .fixed(len_varint);
 
     const tag: Tag = .{ .wire_type = .len, .field = 1 };
@@ -656,15 +696,42 @@ test "captureField accepts a maximal 10-byte length varint shape" {
     try std.testing.expectEqual(10, consumed);
 }
 
+/// Bounds of a submessage being decoded by `decodeMessage`.
+pub const SubmessageOptions = struct {
+    /// Number of bytes to parse. Provided for length-prefixed submessages.
+    bytes: ?usize = null,
+    /// Field number of a delimited (group-encoded) submessage. Decoding
+    /// stops after the matching EGROUP tag, which must be present.
+    group: ?u32 = null,
+    /// Known extensions, validated when decoding messages they extend.
+    extensions: ?*const ExtensionRegistry = null,
+};
+
+/// Stores a closed-enum value that matches none of the enumerators as an
+/// unknown varint field, as the protobuf spec requires for closed enums.
+fn appendUnknownVarint(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    field: u29,
+    raw: i32,
+) std.mem.Allocator.Error!void {
+    var tag_bytes: [10]u8 = undefined;
+    const tag_len = encodeTagBytes(.{ .wire_type = .varint, .field = field }, &tag_bytes);
+    try buf.appendSlice(allocator, tag_bytes[0..tag_len]);
+    // Negative values are sign-extended to 64 bits, as for int32 fields.
+    var value: u64 = @bitCast(@as(i64, raw));
+    while (value > 0x7F) : (value >>= 7) {
+        try buf.append(allocator, 0x80 | @as(u8, @truncate(value)));
+    }
+    try buf.append(allocator, @intCast(value));
+}
+
 /// Decode a message from reader.
 pub fn decodeMessage(
     result: anytype,
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
-    options: struct {
-        /// Number of bytes to parse. Provided for all submessages.
-        bytes: ?usize = null,
-    },
+    options: SubmessageOptions,
 ) (std.Io.Reader.Error || std.mem.Allocator.Error || protobuf.DecodingError)!usize {
     comptime std.debug.assert(@typeInfo(@TypeOf(result)) == .pointer);
     const Result = comptime @typeInfo(@TypeOf(result)).pointer.child;
@@ -678,8 +745,15 @@ pub fn decodeMessage(
     var unknown_buf: if (has_unknown_fields) std.ArrayList(u8) else void =
         if (comptime has_unknown_fields) .empty else {};
     defer if (comptime has_unknown_fields) unknown_buf.deinit(allocator);
+    // Accumulate extension fields if the struct declares extension ranges.
+    const has_extensions = comptime @hasField(Result, "_extensions");
+    var extension_buf: if (has_extensions) std.ArrayList(u8) else void =
+        if (comptime has_extensions) .empty else {};
+    defer if (comptime has_extensions) extension_buf.deinit(allocator);
     main_loop: while (true) {
         const tag: Tag, const tag_c = b: {
+            // A group must be terminated by its EGROUP tag, never by EOF.
+            if (options.group != null) break :b try Tag.decode(reader);
             if (options.bytes) |b| {
                 if (consumed < b) {
                     break :b try Tag.decode(reader);
@@ -693,19 +767,41 @@ pub fn decodeMessage(
         };
         consumed += tag_c;
 
-        @setEvalBranchQuota(50_000);
-        inline for (@typeInfo(@TypeOf(desc_table)).@"struct".fields) |field| {
+        if (tag.wire_type == .egroup) {
+            if (options.group) |group| {
+                if (tag.field == group) break :main_loop;
+            }
+            // An EGROUP tag that does not close the current group is invalid.
+            return error.InvalidInput;
+        }
+
+        // MessageSet: extensions are encoded as items of group 1, holding
+        // their type id and message.
+        if (comptime extension.isMessageSet(Result)) {
+            if (tag.field == 1 and tag.wire_type == .sgroup) {
+                consumed += try extension.readMessageSetItem(allocator, reader, &extension_buf);
+                continue :main_loop;
+            }
+        }
+
+        const desc_info = @typeInfo(@TypeOf(desc_table)).@"struct";
+        fields: inline for (desc_info.field_names) |field_name| {
             const field_desc: protobuf.FieldDescriptor =
-                comptime @field(desc_table, field.name);
-            const field_info: std.builtin.Type.StructField =
-                std.meta.fieldInfo(Result, @field(ResultField, field.name));
+                comptime @field(desc_table, field_name);
+            const field_info =
+                std.meta.fieldInfo(Result, @field(ResultField, field_name));
 
             if (comptime field_desc.ftype != .oneof) {
                 if (comptime field_desc.field_number == null)
                     comptime continue;
                 const fnum = comptime field_desc.field_number.?;
                 if (fnum != tag.field) comptime continue;
-                if (comptime field_desc.ftype == .packed_repeated) {
+                if (comptime field_desc.isDelimited()) {
+                    if (tag.wire_type != .sgroup) {
+                        @branchHint(.cold);
+                        return error.InvalidInput;
+                    }
+                } else if (comptime field_desc.ftype == .packed_repeated) {
                     // Packed repeated fields may be encoded as non-packed.
                     if (tag.wire_type != .len and
                         tag.wire_type != field_desc.ftype.packed_repeated.toWire())
@@ -727,7 +823,7 @@ pub fn decodeMessage(
                 }
             }
 
-            const Field = comptime @FieldType(Result, field.name);
+            const Field = comptime @FieldType(Result, field_name);
             const field_ti = comptime @typeInfo(Field);
 
             switch (comptime field_desc.ftype) {
@@ -756,13 +852,19 @@ pub fn decodeMessage(
                             _ = try reader.readSliceAll(new);
                             consumed += @intCast(len);
                         }
+                        if (comptime field_desc.verifiesUtf8()) {
+                            if (!std.unicode.utf8ValidateSlice(new)) {
+                                @branchHint(.cold);
+                                return error.InvalidInput;
+                            }
+                        }
 
                         // Free potentially existing string/bytes before
                         // replacing field.
                         if (comptime Field == []const u8) {
                             const existing: []const u8 =
-                                @field(result, field.name);
-                            if (comptime field_info.defaultValue()) |default| {
+                                @field(result, field_name);
+                            if (comptime field_info.attrs.defaultValue(Field)) |default| {
                                 if (default.ptr != existing.ptr and
                                     existing.len > 0)
                                 {
@@ -772,9 +874,9 @@ pub fn decodeMessage(
                                 allocator.free(existing);
                             }
                         } else if (comptime Field == ?[]const u8) {
-                            if (@field(result, field.name)) |existing| {
+                            if (@field(result, field_name)) |existing| {
                                 if (existing.len > 0) {
-                                    if (comptime field_info.defaultValue()) |opt| {
+                                    if (comptime field_info.attrs.defaultValue(Field)) |opt| {
                                         if (comptime opt != null) {
                                             if (opt.?.ptr != existing.ptr) {
                                                 allocator.free(existing);
@@ -787,11 +889,11 @@ pub fn decodeMessage(
                             }
                         } else unreachable;
 
-                        @field(result, field.name) = new;
+                        @field(result, field_name) = new;
                     } else {
                         const val, const c = try decodeScalar(scalar, reader);
                         consumed += c;
-                        @field(result, field.name) = val;
+                        @field(result, field_name) = val;
                     }
                 },
                 .@"enum" => {
@@ -806,23 +908,25 @@ pub fn decodeMessage(
                         } else {
                             break :b enumFromRaw(Field, raw);
                         }
-                    } orelse {
-                        @branchHint(.cold);
-                        return error.InvalidInput;
                     };
-                    @field(result, field.name) = decoded;
+                    if (decoded) |value| {
+                        @field(result, field_name) = value;
+                    } else if (comptime has_unknown_fields) {
+                        // Unknown values of closed enums are unknown fields.
+                        try appendUnknownVarint(allocator, &unknown_buf, tag.field, raw);
+                    }
                 },
                 .packed_repeated => |repeated| {
                     const is_null = if (comptime field_ti == .optional) b: {
-                        if (@field(result, field.name) == null) {
-                            @field(result, field.name) = .empty;
+                        if (@field(result, field_name) == null) {
+                            @field(result, field_name) = .empty;
                             break :b true;
                         }
                         break :b false;
                     } else false;
                     errdefer if (comptime field_ti == .optional) {
                         if (is_null) {
-                            @field(result, field.name) = null;
+                            @field(result, field_name) = null;
                         }
                     };
 
@@ -830,67 +934,101 @@ pub fn decodeMessage(
                     if (tag.wire_type == .len) {
                         const len, const c = try decodeScalar(.int32, reader);
                         consumed += c;
+                        if (len < 0) {
+                            @branchHint(.cold);
+                            return error.InvalidInput;
+                        }
 
                         consumed += try decodeRepeated(
                             if (comptime field_ti == .optional)
-                                &@field(result, field.name).?
+                                &@field(result, field_name).?
                             else
-                                &@field(result, field.name),
+                                &@field(result, field_name),
                             allocator,
                             repeated,
                             reader,
-                            .{ .bytes = @intCast(len) },
+                            .{
+                                .bytes = @intCast(len),
+                                .unknown_fields = if (comptime has_unknown_fields) &unknown_buf else null,
+                                .field_number = tag.field,
+                                .extensions = options.extensions,
+                            },
                         );
                     }
                     // Unpacked encoding, despite packed repeated field.
                     else {
                         consumed += try decodeRepeated(
                             if (comptime field_ti == .optional)
-                                &@field(result, field.name).?
+                                &@field(result, field_name).?
                             else
-                                &@field(result, field.name),
+                                &@field(result, field_name),
                             allocator,
                             repeated,
                             reader,
-                            .{},
+                            .{
+                                .unknown_fields = if (comptime has_unknown_fields) &unknown_buf else null,
+                                .field_number = tag.field,
+                                .extensions = options.extensions,
+                            },
                         );
                     }
                 },
                 .repeated => |repeated| {
                     const is_null = if (comptime field_ti == .optional) b: {
-                        if (@field(result, field.name) == null) {
-                            @field(result, field.name) = .empty;
+                        if (@field(result, field_name) == null) {
+                            @field(result, field_name) = .empty;
                             break :b true;
                         }
                         break :b false;
                     } else false;
                     errdefer if (comptime field_ti == .optional) {
                         if (is_null) {
-                            @field(result, field.name) = null;
+                            @field(result, field_name) = null;
                         }
                     };
                     const len: ?usize = if (tag.wire_type == .len) b: {
                         const len, const c = try decodeScalar(.int32, reader);
                         consumed += c;
+                        if (len < 0) {
+                            @branchHint(.cold);
+                            return error.InvalidInput;
+                        }
                         break :b @intCast(len);
                     } else null;
                     consumed += try decodeRepeated(
-                        &@field(result, field.name),
+                        &@field(result, field_name),
                         allocator,
                         repeated,
                         reader,
-                        .{ .bytes = len },
+                        .{
+                            .bytes = len,
+                            .group = if (comptime field_desc.isDelimited()) tag.field else null,
+                            .verify_utf8 = comptime field_desc.verifiesUtf8(),
+                            .unknown_fields = if (comptime has_unknown_fields) &unknown_buf else null,
+                            .field_number = tag.field,
+                            .extensions = options.extensions,
+                        },
                     );
                 },
                 .submessage => {
-                    std.debug.assert(tag.wire_type == .len);
+                    const delimited = comptime field_desc.isDelimited();
+                    std.debug.assert(tag.wire_type == if (delimited) .sgroup else .len);
 
-                    const len, const c = try decodeScalar(.int32, reader);
-                    consumed += c;
-                    if (len < 0) {
-                        @branchHint(.cold);
-                        return error.InvalidInput;
-                    }
+                    // Delimited submessages have no length prefix; they end
+                    // at the matching EGROUP tag instead.
+                    const len: i32 = if (delimited) -1 else b: {
+                        const len, const c = try decodeScalar(.int32, reader);
+                        consumed += c;
+                        if (len < 0) {
+                            @branchHint(.cold);
+                            return error.InvalidInput;
+                        }
+                        break :b len;
+                    };
+                    const sub_options: SubmessageOptions = if (delimited)
+                        .{ .group = tag.field, .extensions = options.extensions }
+                    else
+                        .{ .bytes = @intCast(len), .extensions = options.extensions };
 
                     // All submessages must be optional; submessages always
                     // have an explicit field presence, which means the
@@ -903,33 +1041,33 @@ pub fn decodeMessage(
                     if (comptime inner_ti == .pointer) {
                         const SubMessage = inner_ti.pointer.child;
                         const is_null = b: {
-                            if (@field(result, field.name) == null) {
-                                @field(result, field.name) =
+                            if (@field(result, field_name) == null) {
+                                @field(result, field_name) =
                                     try allocator.create(SubMessage);
                                 errdefer allocator.destroy(
-                                    @field(result, field.name).?,
+                                    @field(result, field_name).?,
                                 );
 
-                                @field(result, field.name).?.* =
+                                @field(result, field_name).?.* =
                                     try protobuf.init(SubMessage, allocator);
                                 break :b true;
                             }
                             break :b false;
                         };
                         errdefer if (is_null) {
-                            @field(result, field.name).?.deinit(allocator);
-                            allocator.destroy(@field(result, field.name).?);
-                            @field(result, field.name) = null;
+                            @field(result, field_name).?.deinit(allocator);
+                            allocator.destroy(@field(result, field_name).?);
+                            @field(result, field_name) = null;
                         };
 
-                        if (len > 0) {
+                        if (delimited or len > 0) {
                             const message_consumed = try decodeMessage(
-                                @field(result, field.name).?,
+                                @field(result, field_name).?,
                                 allocator,
                                 reader,
-                                .{ .bytes = @intCast(len) },
+                                sub_options,
                             );
-                            if (message_consumed > len) {
+                            if (!delimited and message_consumed > len) {
                                 @branchHint(.cold);
                                 return error.InvalidInput;
                             }
@@ -938,26 +1076,26 @@ pub fn decodeMessage(
                     } else {
                         const SubMessage = field_ti.optional.child;
                         const is_null = b: {
-                            if (@field(result, field.name) == null) {
-                                @field(result, field.name) =
+                            if (@field(result, field_name) == null) {
+                                @field(result, field_name) =
                                     try protobuf.init(SubMessage, allocator);
                                 break :b true;
                             }
                             break :b false;
                         };
                         errdefer if (is_null) {
-                            @field(result, field.name).?.deinit(allocator);
-                            @field(result, field.name) = null;
+                            @field(result, field_name).?.deinit(allocator);
+                            @field(result, field_name) = null;
                         };
 
-                        if (len > 0) {
+                        if (delimited or len > 0) {
                             const message_consumed = try decodeMessage(
-                                &@field(result, field.name).?,
+                                &@field(result, field_name).?,
                                 allocator,
                                 reader,
-                                .{ .bytes = @intCast(len) },
+                                sub_options,
                             );
-                            if (message_consumed > len) {
+                            if (!delimited and message_consumed > len) {
                                 @branchHint(.cold);
                                 return error.InvalidInput;
                             }
@@ -975,9 +1113,9 @@ pub fn decodeMessage(
                     const oneof_ti = comptime @typeInfo(OneOf).@"union";
 
                     const inner_desc_table = comptime OneOf._desc_table;
-                    oo_fields: inline for (oneof_ti.fields) |oo_field| {
+                    oo_fields: inline for (oneof_ti.field_names, oneof_ti.field_types) |oo_field_name, OoField| {
                         const inner_desc: protobuf.FieldDescriptor =
-                            comptime @field(inner_desc_table, oo_field.name);
+                            comptime @field(inner_desc_table, oo_field_name);
 
                         if (comptime inner_desc.field_number == null)
                             comptime continue :oo_fields;
@@ -985,12 +1123,12 @@ pub fn decodeMessage(
                             comptime continue :oo_fields;
                         }
 
-                        if (inner_desc.ftype.toWire() != tag.wire_type) {
+                        if ((comptime inner_desc.toWire()) != tag.wire_type) {
                             @branchHint(.cold);
                             return error.InvalidInput;
                         }
 
-                        const oo_field_ti = @typeInfo(oo_field.type);
+                        const oo_field_ti = @typeInfo(OoField);
                         switch (comptime inner_desc.ftype) {
                             .scalar => |scalar| {
                                 if (comptime scalar.isSlice()) {
@@ -999,7 +1137,7 @@ pub fn decodeMessage(
                                     // `oneof` fields are always non-optional
                                     // as `oneof` has explicit presence.
                                     std.debug.assert(
-                                        oo_field.type == []const u8,
+                                        OoField == []const u8,
                                     );
 
                                     std.debug.assert(tag.wire_type == .len);
@@ -1022,26 +1160,32 @@ pub fn decodeMessage(
                                         _ = try reader.readSliceAll(new);
                                         consumed += @intCast(len);
                                     }
+                                    if (comptime inner_desc.verifiesUtf8()) {
+                                        if (!std.unicode.utf8ValidateSlice(new)) {
+                                            @branchHint(.cold);
+                                            return error.InvalidInput;
+                                        }
+                                    }
 
                                     // Free potentially existing union field
                                     // just before replacing.
                                     protobuf.deinitOneof(
-                                        &@field(result, field.name),
+                                        &@field(result, field_name),
                                         allocator,
                                     );
 
-                                    @field(result, field.name) = @unionInit(
+                                    @field(result, field_name) = @unionInit(
                                         OneOf,
-                                        oo_field.name,
+                                        oo_field_name,
                                         new,
                                     );
                                 } else {
                                     const val, const c =
                                         try decodeScalar(scalar, reader);
                                     consumed += c;
-                                    @field(result, field.name) = @unionInit(
+                                    @field(result, field_name) = @unionInit(
                                         OneOf,
-                                        oo_field.name,
+                                        oo_field_name,
                                         val,
                                     );
                                 }
@@ -1051,37 +1195,51 @@ pub fn decodeMessage(
                                     try decodeScalar(.int32, reader);
                                 consumed += c;
                                 const decoded = enumFromRaw(
-                                    oo_field.type,
+                                    OoField,
                                     raw,
                                 ) orelse {
-                                    @branchHint(.cold);
-                                    return error.InvalidInput;
+                                    // Unknown values of closed enums are
+                                    // unknown fields; the oneof is untouched.
+                                    if (comptime has_unknown_fields) {
+                                        try appendUnknownVarint(allocator, &unknown_buf, tag.field, raw);
+                                    }
+                                    break :oo_fields;
                                 };
 
                                 // Free potentially existing union field just
                                 // before replacing.
                                 protobuf.deinitOneof(
-                                    &@field(result, field.name),
+                                    &@field(result, field_name),
                                     allocator,
                                 );
 
-                                @field(result, field.name) = @unionInit(
+                                @field(result, field_name) = @unionInit(
                                     OneOf,
-                                    oo_field.name,
+                                    oo_field_name,
                                     decoded,
                                 );
                             },
                             .submessage => {
-                                std.debug.assert(tag.wire_type == .len);
+                                const delimited = comptime inner_desc.isDelimited();
+                                std.debug.assert(tag.wire_type == if (delimited) .sgroup else .len);
 
-                                const len, const c =
-                                    try decodeScalar(.int32, reader);
-                                consumed += c;
+                                // Delimited submessages have no length prefix;
+                                // they end at the matching EGROUP tag instead.
+                                const len: i32 = if (delimited) -1 else b: {
+                                    const len, const c =
+                                        try decodeScalar(.int32, reader);
+                                    consumed += c;
 
-                                if (len < 0) {
-                                    @branchHint(.cold);
-                                    return error.InvalidInput;
-                                }
+                                    if (len < 0) {
+                                        @branchHint(.cold);
+                                        return error.InvalidInput;
+                                    }
+                                    break :b len;
+                                };
+                                const sub_options: SubmessageOptions = if (delimited)
+                                    .{ .group = tag.field, .extensions = options.extensions }
+                                else
+                                    .{ .bytes = @intCast(len), .extensions = options.extensions };
 
                                 // Submessages are non-optional, as `oneof`s
                                 // also have explicit presence.
@@ -1094,67 +1252,67 @@ pub fn decodeMessage(
                                     if (comptime oo_field_ti == .pointer)
                                         oo_field_ti.pointer.child
                                     else
-                                        oo_field.type;
+                                        OoField;
 
-                                if (@field(result, field.name) != null) {
+                                if (@field(result, field_name) != null) {
                                     // If a matching submessage field already
                                     // exists, the incoming submessage is
                                     // merged. Otherwise, the existing field
                                     // is freed and set to null.
                                     const incoming_tag = comptime @field(
                                         std.meta.Tag(OneOf),
-                                        oo_field.name,
+                                        oo_field_name,
                                     );
                                     if (std.meta.activeTag(
-                                        @field(result, field.name).?,
+                                        @field(result, field_name).?,
                                     ) != incoming_tag) {
                                         protobuf.deinitOneof(
-                                            &@field(result, field.name),
+                                            &@field(result, field_name),
                                             allocator,
                                         );
 
                                         std.debug.assert(@field(
                                             result,
-                                            field.name,
+                                            field_name,
                                         ) == null);
                                     }
                                 }
                                 const is_null =
-                                    @field(result, field.name) == null;
+                                    @field(result, field_name) == null;
                                 if (comptime oo_field_ti == .pointer) {
                                     if (is_null) {
-                                        @field(result, field.name) = @unionInit(
+                                        @field(result, field_name) = @unionInit(
                                             OneOf,
-                                            oo_field.name,
+                                            oo_field_name,
                                             try allocator.create(SubMessage),
                                         );
                                         @field(
-                                            @field(result, field.name).?,
-                                            oo_field.name,
+                                            @field(result, field_name).?,
+                                            oo_field_name,
                                         ) = try .init(allocator);
                                     }
                                     errdefer if (is_null) {
                                         @field(@field(
                                             result,
-                                            field.name,
-                                        ).?, oo_field.name).deinit(allocator);
+                                            field_name,
+                                        ).?, oo_field_name).deinit(allocator);
                                         allocator.destroy(
-                                            @field(result, field.name).?,
+                                            @field(result, field_name).?,
                                         );
-                                        @field(result, field.name) = null;
+                                        @field(result, field_name) = null;
                                     };
 
-                                    if (len > 0) {
+                                    if (delimited or len > 0) {
                                         const m_consumed = try decodeMessage(
                                             @field(
-                                                @field(result, field.name).?,
-                                                oo_field.name,
+                                                @field(result, field_name).?,
+                                                oo_field_name,
                                             ),
                                             allocator,
                                             reader,
-                                            .{ .bytes = @intCast(len) },
+                                            sub_options,
                                         );
-                                        if (m_consumed > len) {
+                                        if (!delimited and m_consumed > len) {
                                             @branchHint(.cold);
                                             return error.InvalidInput;
                                         }
@@ -1162,10 +1320,10 @@ pub fn decodeMessage(
                                     }
                                 } else {
                                     if (is_null) {
-                                        @field(result, field.name) =
+                                        @field(result, field_name) =
                                             @unionInit(
                                                 OneOf,
-                                                oo_field.name,
+                                                oo_field_name,
                                                 try protobuf.init(
                                                     SubMessage,
                                                     allocator,
@@ -1174,23 +1332,23 @@ pub fn decodeMessage(
                                     }
                                     errdefer if (is_null) {
                                         @field(
-                                            @field(result, field.name).?,
-                                            oo_field.name,
+                                            @field(result, field_name).?,
+                                            oo_field_name,
                                         ).deinit(allocator);
-                                        @field(result, field.name) = null;
+                                        @field(result, field_name) = null;
                                     };
 
-                                    if (len > 0) {
+                                    if (delimited or len > 0) {
                                         const m_consumed = try decodeMessage(
                                             &@field(
-                                                @field(result, field.name).?,
-                                                oo_field.name,
+                                                @field(result, field_name).?,
+                                                oo_field_name,
                                             ),
                                             allocator,
                                             reader,
-                                            .{ .bytes = @intCast(len) },
+                                            sub_options,
                                         );
-                                        if (m_consumed > len) {
+                                        if (!delimited and m_consumed > len) {
                                             @branchHint(.cold);
                                             return error.InvalidInput;
                                         }
@@ -1205,30 +1363,74 @@ pub fn decodeMessage(
                         }
                         break :oo_fields;
                     } else {
-                        if (comptime has_unknown_fields) {
-                            consumed += try captureField(allocator, reader, tag, &unknown_buf);
-                        } else {
-                            consumed += try skipField(reader, tag);
-                        }
+                        // Not a field of this oneof: try the next fields,
+                        // which may include other oneofs.
+                        continue :fields;
                     }
                 },
             }
             comptime break;
         } else {
-            if (comptime has_unknown_fields) {
-                consumed += try captureField(allocator, reader, tag, &unknown_buf);
-            } else {
-                consumed += try skipField(reader, tag);
-            }
+            consumed += try captureUnmatched(
+                Result,
+                allocator,
+                reader,
+                tag,
+                if (comptime has_unknown_fields) &unknown_buf else null,
+                if (comptime has_extensions) &extension_buf else null,
+            );
         }
     }
     if (comptime has_unknown_fields) {
-        result._unknown_fields = try unknown_buf.toOwnedSlice(allocator);
+        try appendOwned(allocator, &result._unknown_fields, &unknown_buf);
+    }
+    if (comptime has_extensions) {
+        try appendOwned(allocator, &result._extensions.records, &extension_buf);
+        if (options.extensions) |registry| {
+            try registry.validate(Result, result._extensions.records, allocator);
+        }
     }
     return consumed;
 }
 
-fn skipField(reader: *std.Io.Reader, tag: Tag) !usize {
+/// Stores a field that matches no field of `Result`: in the extension records
+/// when it is in an extension range, else in the unknown fields if they are
+/// kept. Returns the number of bytes consumed after the tag.
+fn captureUnmatched(
+    comptime Result: type,
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    tag: Tag,
+    unknown: ?*std.ArrayList(u8),
+    extensions: ?*std.ArrayList(u8),
+) (std.Io.Reader.Error || std.mem.Allocator.Error || protobuf.DecodingError)!usize {
+    if (comptime @hasDecl(Result, "_extensions_info")) {
+        if (extensions) |buf| {
+            inline for (Result._extensions_info.ranges) |range| {
+                if (tag.field >= range[0] and tag.field < range[1]) {
+                    return captureField(allocator, reader, tag, buf);
+                }
+            }
+        }
+    }
+    if (unknown) |buf| return captureField(allocator, reader, tag, buf);
+    return skipField(reader, tag);
+}
+
+/// Appends the bytes of `buf` to the owned slice `dest`. Messages may be
+/// decoded several times (merged), so existing bytes are kept.
+fn appendOwned(allocator: std.mem.Allocator, dest: *[]const u8, buf: *std.ArrayList(u8)) std.mem.Allocator.Error!void {
+    if (buf.items.len == 0) return;
+    if (dest.len == 0) {
+        dest.* = try buf.toOwnedSlice(allocator);
+        return;
+    }
+    const merged = try std.mem.concat(allocator, u8, &.{ dest.*, buf.items });
+    allocator.free(dest.*);
+    dest.* = merged;
+}
+
+pub fn skipField(reader: *std.Io.Reader, tag: Tag) !usize {
     var consumed: usize = 0;
 
     // If field number was not found, skip unknown field.
@@ -1284,7 +1486,7 @@ fn skipField(reader: *std.Io.Reader, tag: Tag) !usize {
 
 // Encode a runtime tag value as a varint to a buffer. Returns bytes written.
 fn encodeTagBytes(tag: Tag, buf: *[10]u8) usize {
-    const tag_u64: u64 = (@as(u64, tag.field) << 3) | @intFromEnum(tag.wire_type);
+    const tag_u64: u64 = (@as(u64, tag.field) << 3) | @backingInt(tag.wire_type);
     var raw = tag_u64;
     var i: usize = 0;
     while (raw > 0x7F) {
@@ -1352,8 +1554,28 @@ fn captureField(
             try buf.appendSlice(allocator, data);
             data_consumed += @intCast(len_val);
         },
-        .sgroup, .egroup => {
-            data_consumed += try skipField(reader, tag);
+        .sgroup => {
+            // Capture every nested field up to and including the matching
+            // EGROUP tag, so that the group round-trips verbatim.
+            while (true) {
+                const inner_tag, const tag_c = try Tag.decode(reader);
+                data_consumed += tag_c;
+                if (inner_tag.wire_type == .egroup) {
+                    if (inner_tag.field != tag.field) {
+                        @branchHint(.cold);
+                        return error.InvalidInput;
+                    }
+                    const end_len = encodeTagBytes(inner_tag, &tag_bytes);
+                    try buf.appendSlice(allocator, tag_bytes[0..end_len]);
+                    break;
+                }
+                data_consumed += try captureField(allocator, reader, inner_tag, buf);
+            }
+        },
+        .egroup => {
+            // An unmatched egroup tag is invalid.
+            @branchHint(.cold);
+            return error.InvalidInput;
         },
     }
     return data_consumed;

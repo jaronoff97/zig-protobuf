@@ -165,7 +165,7 @@ pub const Duration = struct {
             const negative = sec_str.len > 0 and sec_str[0] == '-';
             seconds = std.fmt.parseInt(i64, sec_str, 10) catch return error.UnexpectedToken;
             if (frac_str.len == 0 or frac_str.len > 9) return error.UnexpectedToken;
-            var frac_buf: [9]u8 = [_]u8{'0'} ** 9;
+            var frac_buf: [9]u8 = @splat('0');
             @memcpy(frac_buf[0..frac_str.len], frac_str);
             const frac_val = std.fmt.parseInt(u32, &frac_buf, 10) catch return error.UnexpectedToken;
             nanos = @intCast(frac_val);
@@ -359,7 +359,7 @@ pub const NullValue = enum(i32) {
                     else => return error.UnexpectedToken,
                 };
                 const val = std.fmt.parseInt(i32, str, 10) catch return error.UnexpectedToken;
-                return @enumFromInt(val);
+                return @fromBackingInt(@intCast(val));
             },
             .string => {
                 const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
@@ -460,6 +460,13 @@ pub const Struct = struct {
 
 // ─── google.protobuf.Value ──────────────────────────────────────────────────
 
+/// Maximum nesting of `Value`s accepted when parsing JSON, the default
+/// recursion limit of the reference implementation.
+const max_value_depth = 100;
+/// Nesting of the `Value` being parsed from JSON. `jsonParse` cannot carry
+/// extra state, so it is tracked per thread.
+threadlocal var value_parse_depth: u32 = 0;
+
 pub const Value = struct {
     kind: ?kind_union = null,
 
@@ -508,6 +515,12 @@ pub const Value = struct {
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        // Values nest through Struct and ListValue. Deeply nested input is
+        // rejected, like other implementations do, to bound the recursion.
+        if (value_parse_depth >= max_value_depth) return error.SyntaxError;
+        value_parse_depth += 1;
+        defer value_parse_depth -= 1;
+
         switch (try source.peekNextTokenType()) {
             .null => {
                 _ = try source.next();
@@ -692,7 +705,7 @@ pub const Timestamp = struct {
             while (pos < str.len and str[pos] >= '0' and str[pos] <= '9') pos += 1;
             const frac_len = pos - frac_start;
             if (frac_len == 0 or frac_len > 9) return error.UnexpectedToken;
-            var frac_buf: [9]u8 = [_]u8{'0'} ** 9;
+            var frac_buf: [9]u8 = @splat('0');
             @memcpy(frac_buf[0..frac_len], str[frac_start..pos]);
             nanos = @intCast(std.fmt.parseInt(u32, &frac_buf, 10) catch return error.UnexpectedToken);
         }
@@ -1234,3 +1247,20 @@ pub const Empty = struct {
         return protobuf.json.parse(@This(), allocator, source, options);
     }
 };
+
+test "Value: JSON nesting is bounded" {
+    const allocator = std.testing.allocator;
+    const open_25: [25]u8 = @splat('[');
+    const close_25: [25]u8 = @splat(']');
+    const depth_ok = open_25 ++ "1" ++ close_25;
+    const ok = try Value.jsonDecode(depth_ok, .{}, allocator);
+    ok.deinit();
+
+    const open_200: [200]u8 = @splat('[');
+    const close_200: [200]u8 = @splat(']');
+    const too_deep = open_200 ++ "1" ++ close_200;
+    try std.testing.expectError(error.SyntaxError, Value.jsonDecode(too_deep, .{}, allocator));
+    // The depth is reset after a failure.
+    const again = try Value.jsonDecode(depth_ok, .{}, allocator);
+    again.deinit();
+}
